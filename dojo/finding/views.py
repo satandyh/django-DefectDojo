@@ -31,7 +31,7 @@ from dojo.forms import NoteForm, TypedNoteForm, CloseFindingForm, FindingForm, P
     FindingFormID, FindingBulkUpdateForm, MergeFindings
 from dojo.models import IMPORT_UNTOUCHED_FINDING, Finding, Finding_Group, Notes, NoteHistory, Note_Type, \
     BurpRawRequestResponse, Stub_Finding, Endpoint, Finding_Template, Endpoint_Status, \
-    FileAccessToken, GITHUB_PKey, GITHUB_Issue, Dojo_User, Cred_Mapping, Test, Product, Test_Import_Finding_Action, User, Engagement, Vulnerability_Reference_Template
+    FileAccessToken, GITHUB_PKey, GITHUB_Issue, Dojo_User, Cred_Mapping, Test, Product, Test_Import_Finding_Action, User, Engagement, Vulnerability_Id_Template
 from dojo.utils import get_page_items, add_breadcrumb, FileIterWrapper, process_notifications, \
     get_system_setting, apply_cwe_to_template, Product_Tab, calculate_grade, \
     redirect_to_return_url_or_else, get_return_url, add_external_issue, update_external_issue, \
@@ -127,13 +127,13 @@ def findings(request, pid=None, eid=None, view=None, filter_name=None, order_by=
     if view == "All":
         filter_name = "All"
     else:
-        print('Filtering!', view)
+        logger.debug('Filtering!: %s', view)
 
     if pid:
         product = get_object_or_404(Product, id=pid)
         user_has_permission_or_403(request.user, product, Permissions.Product_View)
         show_product_column = False
-        product_tab = Product_Tab(pid, title="Findings", tab="findings")
+        product_tab = Product_Tab(product, title="Findings", tab="findings")
         jira_project = jira_helper.get_jira_project(product)
         github_config = GITHUB_PKey.objects.filter(product=pid).first()
 
@@ -141,7 +141,7 @@ def findings(request, pid=None, eid=None, view=None, filter_name=None, order_by=
         engagement = get_object_or_404(Engagement, id=eid)
         user_has_permission_or_403(request.user, engagement, Permissions.Engagement_View)
         show_product_column = False
-        product_tab = Product_Tab(engagement.product_id, title=engagement.name, tab="engagements")
+        product_tab = Product_Tab(engagement.product, title=engagement.name, tab="engagements")
         jira_project = jira_helper.get_jira_project(engagement)
         github_config = GITHUB_PKey.objects.filter(product__engagement=eid).first()
     else:
@@ -220,7 +220,7 @@ def prefetch_for_findings(findings, prefetch_type='all'):
         prefetched_findings = prefetched_findings.prefetch_related('finding_group_set')
         prefetched_findings = prefetched_findings.prefetch_related('test__engagement__product__members')
         prefetched_findings = prefetched_findings.prefetch_related('test__engagement__product__prod_type__members')
-        prefetched_findings = prefetched_findings.prefetch_related('vulnerability_reference_set')
+        prefetched_findings = prefetched_findings.prefetch_related('vulnerability_id_set')
     else:
         logger.debug('unable to prefetch because query was already executed')
 
@@ -252,7 +252,7 @@ def prefetch_for_similar_findings(findings):
         # prefetched_findings = prefetched_findings.prefetch_related('endpoint_status__endpoint')
         # prefetched_findings = prefetched_findings.annotate(active_endpoint_count=Count('endpoint_status__id', filter=Q(endpoint_status__mitigated=False)))
         # prefetched_findings = prefetched_findings.annotate(mitigated_endpoint_count=Count('endpoint_status__id', filter=Q(endpoint_status__mitigated=True)))
-        prefetched_findings = prefetched_findings.prefetch_related('vulnerability_reference_set')
+        prefetched_findings = prefetched_findings.prefetch_related('vulnerability_id_set')
     else:
         logger.debug('unable to prefetch because query was already executed')
 
@@ -366,7 +366,7 @@ def view_finding(request, fid):
     for similar_finding in similar_findings:
         similar_finding.related_actions = calculate_possible_related_actions_for_similar_finding(request, finding, similar_finding)
 
-    product_tab = Product_Tab(finding.test.engagement.product.id, title="View Finding", tab="findings")
+    product_tab = Product_Tab(finding.test.engagement.product, title="View Finding", tab="findings")
 
     can_be_pushed_to_jira, can_be_pushed_to_jira_error, error_code = jira_helper.can_be_pushed_to_jira(finding)
 
@@ -471,7 +471,7 @@ def close_finding(request, fid):
     else:
         form = CloseFindingForm(missing_note_types=missing_note_types)
 
-    product_tab = Product_Tab(finding.test.engagement.product.id, title="Close", tab="findings")
+    product_tab = Product_Tab(finding.test.engagement.product, title="Close", tab="findings")
 
     return render(request, 'dojo/close_finding.html', {
         'finding': finding,
@@ -553,7 +553,7 @@ def defect_finding_review(request, fid):
     else:
         form = DefectFindingForm()
 
-    product_tab = Product_Tab(finding.test.engagement.product.id, title="Jira Status Review", tab="findings")
+    product_tab = Product_Tab(finding.test.engagement.product, title="Jira Status Review", tab="findings")
 
     return render(request, 'dojo/defect_finding_review.html', {
         'finding': finding,
@@ -681,7 +681,7 @@ def edit_finding(request, fid):
 
     form = FindingForm(instance=finding, req_resp=req_resp,
                        can_edit_mitigated_data=finding_helper.can_edit_mitigated_data(request.user),
-                       initial={'vulnerability_references': '\n'.join(finding.vulnerability_references)})
+                       initial={'vulnerability_ids': '\n'.join(finding.vulnerability_ids)})
     form_error = False
     jform = None
     push_all_jira_issues = jira_helper.is_push_all_issues(finding)
@@ -813,7 +813,7 @@ def edit_finding(request, fid):
             # any existing finding should be updated
             push_to_jira = push_to_jira and not push_group_to_jira and not new_finding.has_jira_issue
 
-            finding_helper.save_vulnerability_references(new_finding, form.cleaned_data['vulnerability_references'].split())
+            finding_helper.save_vulnerability_ids(new_finding, form.cleaned_data['vulnerability_ids'].split())
 
             # if we're removing the "duplicate" in the edit finding screen
             # do not relaunch deduplication, otherwise, it's never taken into account
@@ -855,7 +855,7 @@ def edit_finding(request, fid):
             if GITHUB_PKey.objects.filter(product=finding.test.engagement.product).exclude(git_conf_id=None):
                 gform = GITHUBFindingForm(enabled=github_enabled, prefix='githubform')
 
-    product_tab = Product_Tab(finding.test.engagement.product.id, title="Edit Finding", tab="findings")
+    product_tab = Product_Tab(finding.test.engagement.product, title="Edit Finding", tab="findings")
 
     return render(request, 'dojo/edit_finding.html', {
         'product_tab': product_tab,
@@ -958,7 +958,7 @@ def request_finding_review(request, fid):
     else:
         form = ReviewFindingForm(finding=finding)
 
-    product_tab = Product_Tab(finding.test.engagement.product.id, title="Review Finding", tab="findings")
+    product_tab = Product_Tab(finding.test.engagement.product, title="Review Finding", tab="findings")
 
     return render(request, 'dojo/review_finding.html', {
         'finding': finding,
@@ -1013,7 +1013,7 @@ def clear_finding_review(request, fid):
     else:
         form = ClearFindingReviewForm(instance=finding)
 
-    product_tab = Product_Tab(finding.test.engagement.product.id, title="Clear Finding Review", tab="findings")
+    product_tab = Product_Tab(finding.test.engagement.product, title="Clear Finding Review", tab="findings")
 
     return render(request, 'dojo/clear_finding_review.html', {
         'finding': finding,
@@ -1048,10 +1048,10 @@ def mktemplate(request, fid):
         template.save()
         template.tags = finding.tags.all()
 
-        for vulnerability_reference in finding.vulnerability_references:
-            Vulnerability_Reference_Template(
+        for vulnerability_id in finding.vulnerability_ids:
+            Vulnerability_Id_Template(
                 finding_template=template,
-                vulnerability_reference=vulnerability_reference
+                vulnerability_id=vulnerability_id
             ).save()
 
         messages.add_message(
@@ -1090,7 +1090,7 @@ def find_template_to_apply(request, fid):
 
     # just query all templates as this weird ordering above otherwise breaks Django ORM
     title_words = get_words_for_field(Finding_Template, 'title')
-    product_tab = Product_Tab(test.engagement.product.id, title="Apply Template to Finding", tab="findings")
+    product_tab = Product_Tab(test.engagement.product, title="Apply Template to Finding", tab="findings")
     return render(
         request, 'dojo/templates.html', {
             'templates': paged_templates,
@@ -1111,10 +1111,10 @@ def choose_finding_template_options(request, tid, fid):
     data = finding.__dict__
     # Not sure what's going on here, just leave same as with django-tagging
     data['tags'] = [tag.name for tag in template.tags.all()]
-    data['vulnerability_references'] = '\n'.join(finding.vulnerability_references)
+    data['vulnerability_ids'] = '\n'.join(finding.vulnerability_ids)
 
     form = ApplyFindingTemplateForm(data=data, template=template)
-    product_tab = Product_Tab(finding.test.engagement.product.id, title="Finding Template Options", tab="findings")
+    product_tab = Product_Tab(finding.test.engagement.product, title="Finding Template Options", tab="findings")
     return render(request, 'dojo/apply_finding_template.html', {
         'finding': finding,
         'product_tab': product_tab,
@@ -1147,7 +1147,7 @@ def apply_template_to_finding(request, fid, tid):
             finding.tags = form.cleaned_data['tags']
 
             finding.cve = None
-            finding_helper.save_vulnerability_references(finding, form.cleaned_data['vulnerability_references'].split())
+            finding_helper.save_vulnerability_ids(finding, form.cleaned_data['vulnerability_ids'].split())
 
             finding.save()
         else:
@@ -1157,7 +1157,7 @@ def apply_template_to_finding(request, fid, tid):
                 'There appears to be errors on the form, please correct below.',
                 extra_tags='alert-danger')
             # form_error = True
-            product_tab = Product_Tab(finding.test.engagement.product.id, title="Apply Finding Template", tab="findings")
+            product_tab = Product_Tab(finding.test.engagement.product, title="Apply Finding Template", tab="findings")
             return render(request, 'dojo/apply_finding_template.html', {
                 'finding': finding,
                 'product_tab': product_tab,
@@ -1249,7 +1249,7 @@ def promote_to_finding(request, fid):
     push_all_jira_issues = jira_helper.is_push_all_issues(finding)
     jform = None
     use_jira = jira_helper.get_jira_project(finding) is not None
-    product_tab = Product_Tab(finding.test.engagement.product.id, title="Promote Finding", tab="findings")
+    product_tab = Product_Tab(finding.test.engagement.product, title="Promote Finding", tab="findings")
 
     if request.method == 'POST':
         form = PromoteFindingForm(request.POST, product=test.engagement.product)
@@ -1312,7 +1312,7 @@ def promote_to_finding(request, fid):
                         jira_helper.finding_link_jira(request, new_finding, new_jira_issue_key)
                         jira_message = 'Linked a JIRA issue successfully.'
 
-            finding_helper.save_vulnerability_references(new_finding, form.cleaned_data['vulnerability_references'].split())
+            finding_helper.save_vulnerability_ids(new_finding, form.cleaned_data['vulnerability_ids'].split())
 
             # Save it and push it to JIRA
             new_finding.save(push_to_jira=push_to_jira)
@@ -1445,7 +1445,7 @@ def add_template(request):
             apply_message = ""
             template = form.save(commit=False)
             template.numerical_severity = Finding.get_numerical_severity(template.severity)
-            finding_helper.save_vulnerability_references_template(template, form.cleaned_data['vulnerability_references'].split())
+            finding_helper.save_vulnerability_ids_template(template, form.cleaned_data['vulnerability_ids'].split())
             template.save()
             form.save_m2m()
             count = apply_cwe_mitigation(form.cleaned_data["apply_to_findings"], template)
@@ -1476,7 +1476,7 @@ def edit_template(request, tid):
     template = get_object_or_404(Finding_Template, id=tid)
     form = FindingTemplateForm(
         instance=template,
-        initial={'vulnerability_references': '\n'.join(template.vulnerability_references)}
+        initial={'vulnerability_ids': '\n'.join(template.vulnerability_ids)}
     )
 
     if request.method == 'POST':
@@ -1484,7 +1484,7 @@ def edit_template(request, tid):
         if form.is_valid():
             template = form.save(commit=False)
             template.numerical_severity = Finding.get_numerical_severity(template.severity)
-            finding_helper.save_vulnerability_references_template(template, form.cleaned_data['vulnerability_references'].split())
+            finding_helper.save_vulnerability_ids_template(template, form.cleaned_data['vulnerability_ids'].split())
             template.save()
             form.save_m2m()
 
@@ -1741,7 +1741,7 @@ def merge_finding_product(request, pid):
                                      'Unable to merge findings. Required fields were not selected.',
                                      extra_tags='alert-danger')
 
-    product_tab = Product_Tab(finding.test.engagement.product.id, title="Merge Findings", tab="findings")
+    product_tab = Product_Tab(finding.test.engagement.product, title="Merge Findings", tab="findings")
     custom_breadcrumb = {"Open Findings": reverse('product_open_findings', args=(finding.test.engagement.product.id, )) + '?test__engagement__product=' + str(finding.test.engagement.product.id)}
 
     return render(request, 'dojo/merge_findings.html', {
